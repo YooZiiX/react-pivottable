@@ -210,6 +210,7 @@ export class Dropdown extends React.PureComponent {
                     this.props.toggle();
                   } else {
                     this.props.setValue(r);
+                    this.props.toggle(); // Close the dropdown after selection
                   }
                 }}
                 className={
