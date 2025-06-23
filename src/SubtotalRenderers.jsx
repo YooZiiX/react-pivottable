@@ -61,6 +61,26 @@ function makeRenderer(opts = {}) {
       // This is an object with flat-keys indicating if the corresponding rows
       // should be collapsed.
       this.state = {collapsedRows: {}, collapsedCols: {}};
+      
+      // Add custom CSS for subtotals if not already present
+      if (opts.subtotals && !document.getElementById('react-pivottable-subtotal-styles')) {
+        const style = document.createElement('style');
+        style.id = 'react-pivottable-subtotal-styles';
+        style.innerHTML = `
+          .pvtSubtotal {
+            font-weight: bold;
+            background-color: #f0f0f0;
+          }
+          .pvtSubtotalRow {
+            border-top: 1px solid #ddd;
+          }
+          .pvtSubtotalVal {
+            color: #777;
+            font-style: italic;
+          }
+        `;
+        document.head.appendChild(style);
+      }
     }
 
     getBasePivotSettings() {
@@ -656,9 +676,12 @@ function makeRenderer(opts = {}) {
 
       const cells = [];
 
+      // Determine if this is a parent row that can be collapsed
       const isParentWithChildren = rowKey.length < rowAttrs.length;
       const isCollapsedParent = isCollapsed && isParentWithChildren;
+      const isSubtotalRow = isParentWithChildren && opts.subtotals;
       
+      // For each visible column, render a cell
       visibleColKeys.forEach((colKey, i) => {
         try {
           if (!rowKey || !colKey) {
@@ -676,9 +699,18 @@ function makeRenderer(opts = {}) {
           
           let aggregator, val, className, valCss = {};
           
-          if (isCollapsedParent) {
-            aggregator = pivotData.getAggregator(rowKey, colKey);
+          // Handle subtotal cells
+          if (isSubtotalRow) {
+            // For subtotal rows, we need to calculate the actual subtotal
+            let value = this.calculateSubtotal(pivotData, rowKey, colKey, pivotSettings);
             className = "pvtSubtotal";
+            
+            // Create a temporary aggregator to format the value
+            const tempAggregator = this.safeGetAggregator(pivotData, [], []);
+            aggregator = {
+              value: () => value,
+              format: tempAggregator ? tempAggregator.format : (x => x)
+            };
             
             if (opts.heatmapMode && rowMapper.totalColor) {
               const cellColor = rowMapper.totalColor(rowKey[0]);
@@ -687,9 +719,18 @@ function makeRenderer(opts = {}) {
               }
             }
           } 
+          // Handle column subtotal cells
           else if (colKey.length < colAttrs.length && this.state.collapsedCols[flatKey(colKey)]) {
-            aggregator = pivotData.getAggregator(rowKey, colKey);
+            // For column subtotals, calculate the actual subtotal
+            let value = this.calculateSubtotal(pivotData, rowKey, colKey, pivotSettings);
             className = "pvtSubtotal";
+            
+            // Create a temporary aggregator to format the value
+            const tempAggregator = this.safeGetAggregator(pivotData, [], []);
+            aggregator = {
+              value: () => value,
+              format: tempAggregator ? tempAggregator.format : (x => x)
+            };
             
             if (opts.heatmapMode && colMapper.totalColor) {
               const cellColor = colMapper.totalColor(colKey[0]);
@@ -698,8 +739,9 @@ function makeRenderer(opts = {}) {
               }
             }
           } 
+          // Regular cells
           else {
-            aggregator = pivotData.getAggregator(rowKey, colKey);
+            aggregator = this.safeGetAggregator(pivotData, rowKey, colKey);
             className = "pvtVal";
             
             if (opts.heatmapMode && colMapper.bgColorFromRowColKey) {
@@ -710,22 +752,40 @@ function makeRenderer(opts = {}) {
             }
           }
           
-          if (!aggregator) {
-            console.warn('No aggregator found for', rowKey, colKey);
-            cells.push(
-              <td
-                className={className}
-                key={`pvtVal-${i}`}
-                style={valCss}
-              >
-                -
-              </td>
-            );
-            return;
+          // If no aggregator found, try to get a subtotal value if appropriate
+          if (!aggregator || (aggregator.value() === null || aggregator.value() === undefined)) {
+            // For empty values, try to get subtotal values if appropriate
+            if (opts.subtotals && rowKey.length > 0) {
+              // Try parent levels for a subtotal value
+              for (let i = rowKey.length - 1; i >= 0; i--) {
+                const subtotalKey = rowKey.slice(0, i);
+                const subtotalAggregator = this.safeGetAggregator(pivotData, subtotalKey, colKey);
+                if (subtotalAggregator && subtotalAggregator.value() !== null && subtotalAggregator.value() !== undefined) {
+                  aggregator = subtotalAggregator;
+                  className += " pvtSubtotalVal";
+                  break;
+                }
+              }
+            }
+            
+            // If still no valid aggregator
+            if (!aggregator || (aggregator.value() === null || aggregator.value() === undefined)) {
+              cells.push(
+                <td
+                  className={className}
+                  key={`pvtVal-${i}`}
+                  style={valCss}
+                >
+                  -
+                </td>
+              );
+              return;
+            }
           }
           
           val = aggregator.value();
-          const formattedVal = (val === null || val === undefined) ? '-' : aggregator.format(val);
+          const isSubtotalValue = className.includes("pvtSubtotalVal");
+          const formattedVal = (val === null || val === undefined || val === 0 || isSubtotalValue) ? '-' : aggregator.format(val);
           
           cells.push(
             <td
@@ -752,11 +812,8 @@ function makeRenderer(opts = {}) {
 
       if (rowTotals) {
         try {
-          let rowTotal = 0;
-          let validValuesFound = false;
+          const className = isSubtotalRow ? "pvtTotal pvtSubtotal" : "pvtTotal";
           let valCss = {};
-          
-          const className = isCollapsedParent ? "pvtTotal pvtSubtotal" : "pvtTotal";
           
           if (opts.heatmapMode && rowMapper.totalColor) {
             const cellColor = rowMapper.totalColor(rowKey[0]);
@@ -776,8 +833,7 @@ function makeRenderer(opts = {}) {
                 if (colAggregator) {
                   const colVal = colAggregator.value();
                   if (colVal !== null && colVal !== undefined && !isNaN(colVal)) {
-                    rowTotal += colVal;
-                    validValuesFound = true;
+                    // We can accumulate values here if needed
                   }
                 }
               }
@@ -786,8 +842,43 @@ function makeRenderer(opts = {}) {
             }
           });
           
-          const totalAggregator = pivotData.getAggregator(rowKey, []);
-          const format = totalAggregator ? totalAggregator.format : null;
+          // Get the row total directly from the pivotData
+          let totalVal = 0;
+          let formattedTotal = '-';
+          
+          // For subtotal rows, calculate the actual sum
+          if (isSubtotalRow) {
+            totalVal = this.calculateSubtotal(pivotData, rowKey, [], pivotSettings);
+          } else {
+            // For regular rows, either get the aggregator or calculate
+            const totalAggregator = this.safeGetAggregator(pivotData, rowKey, []);
+            if (totalAggregator && totalAggregator.value() !== null && totalAggregator.value() !== undefined) {
+              totalVal = totalAggregator.value();
+            } else {
+              // Calculate sum across all visible columns for this row
+              visibleColKeys.forEach(colKey => {
+                const flatColKey = flatKey(colKey);
+                const isColParent = colKey.length < colAttrs.length;
+                const isColCollapsed = this.state.collapsedCols[flatColKey];
+                
+                if (!isColParent || isColCollapsed) {
+                  const agg = this.safeGetAggregator(pivotData, rowKey, colKey);
+                  if (agg) {
+                    const val = agg.value();
+                    if (val !== null && val !== undefined && !isNaN(val)) {
+                      totalVal += val;
+                    }
+                  }
+                }
+              });
+            }
+          }
+          
+          if (totalVal !== 0 || isSubtotalRow) {
+            const tempAggregator = this.safeGetAggregator(pivotData, [], []);
+            const formatFunc = tempAggregator && tempAggregator.format ? tempAggregator.format : (x => x);
+            formattedTotal = totalVal === 0 ? '-' : formatFunc(totalVal);
+          }
           
           cells.push(
             <td
@@ -796,7 +887,7 @@ function makeRenderer(opts = {}) {
               style={valCss}
               onClick={rowTotalCallbacks[flatRowKey]}
             >
-              {validValuesFound ? (format ? format(rowTotal) : rowTotal) : '-'}
+              {formattedTotal}
             </td>
           );
         } catch (error) {
@@ -870,50 +961,50 @@ function makeRenderer(opts = {}) {
           }
 
           let colTotal = 0;
-          let hasCollapsed = Object.values(this.state.collapsedRows).some(Boolean);
-          
-          // Always calculate manually to ensure accuracy with visible elements
-          // and avoid double counting parents and children
           const processedRows = new Set();
           
-          visibleRowKeys.forEach(rowKey => {
-            const flatRowKey = flatKey(rowKey);
-            
-            if (processedRows.has(flatRowKey)) {
-              return;
-            }
-            
-            processedRows.add(flatRowKey);
-            
-            const isCollapsed = this.state.collapsedRows[flatRowKey];
-            const isParent = rowKey.length < rowAttrs.length;
-            
-            if (isCollapsed && isParent) {
+          if (colKey.length < colAttrs.length) {
+            // For subtotal columns, calculate the actual subtotal
+            colTotal = this.calculateSubtotal(pivotData, [], colKey, pivotSettings);
+          } else {
+            // For regular columns, sum the visible row values
+            visibleRowKeys.forEach(rowKey => {
+              const flatRowKey = flatKey(rowKey);
+              
+              if (processedRows.has(flatRowKey)) {
+                return;
+              }
+              
+              processedRows.add(flatRowKey);
+              
+              const isCollapsed = this.state.collapsedRows[flatRowKey];
+              const isParent = rowKey.length < rowAttrs.length;
+              
               try {
-                const aggregator = pivotData.getAggregator(rowKey, colKey);
-                if (aggregator) {
-                  const val = aggregator.value();
-                  if (val !== null && val !== undefined && !isNaN(val)) {
-                    colTotal += val;
+                let value = 0;
+                
+                if (isCollapsed && isParent) {
+                  // If it's a collapsed parent, use the subtotal
+                  value = this.calculateSubtotal(pivotData, rowKey, colKey, pivotSettings);
+                } else if (rowKey.length === rowAttrs.length) {
+                  // For leaf rows, get the direct value
+                  const agg = this.safeGetAggregator(pivotData, rowKey, colKey);
+                  if (agg) {
+                    const val = agg.value();
+                    if (val !== null && val !== undefined && !isNaN(val)) {
+                      value = val;
+                    }
                   }
                 }
-              } catch (e) {
-                console.warn('Error calculating subtotal for collapsed parent', rowKey, colKey, e);
-              }
-            } else {
-              try {
-                const aggregator = pivotData.getAggregator(rowKey, colKey);
-                if (aggregator) {
-                  const val = aggregator.value();
-                  if (val !== null && val !== undefined && !isNaN(val)) {
-                    colTotal += val;
-                  }
+                
+                if (value !== 0) {
+                  colTotal += value;
                 }
               } catch (e) {
                 console.warn('Error calculating cell value', rowKey, colKey, e);
               }
-            }
-          });
+            });
+          }
           
           let valCss = {};
           if (opts.heatmapMode && colMapper.totalColor) {
@@ -923,7 +1014,8 @@ function makeRenderer(opts = {}) {
             }
           }
           
-          const format = pivotData.getAggregator([], colKey).format;
+          const tempAggregator = this.safeGetAggregator(pivotData, [], colKey);
+          const format = tempAggregator && tempAggregator.format ? tempAggregator.format : (x => x);
           
           cells.push(
             <td
@@ -932,7 +1024,7 @@ function makeRenderer(opts = {}) {
               style={valCss}
               onClick={colTotalCallbacks[flatKey(colKey)]}
             >
-              {format ? format(colTotal) : colTotal}
+              {colTotal === 0 ? '-' : (format ? format(colTotal) : colTotal)}
             </td>
           );
         } catch (error) {
@@ -950,73 +1042,56 @@ function makeRenderer(opts = {}) {
 
       if (colTotals) {
         try {
-          // We will calculate the grand total in two ways and compare the results:
-          // 1. By summing the column totals (which are already correctly calculated)
-          // 2. By summing all visible values
-          // This will allow us to verify the consistency of the calculations
+          // For the grand total, we should always use the full dataset regardless of what's collapsed or expanded
+          // This ensures the grand total is always consistent
           
           let grandTotal = 0;
           let validValuesFound = false;
           
-          // Méthode 1: Sommer les totaux de lignes visibles
-          const rowTotals = [];
-          
-          visibleRowKeys.forEach(rowKey => {
-            // Calculer le total de cette ligne en fonction des colonnes visibles
-            let rowTotal = 0;
-            const flatRowKey = flatKey(rowKey);
-            const isRowParent = rowKey.length < rowAttrs.length;
-            const isRowCollapsed = this.state.collapsedRows[flatRowKey];
-            
-            // If it's a collapsed parent, use its subtotal value directly
-            if (isRowCollapsed && isRowParent) {
-              try {
-                const rowAggregator = pivotData.getAggregator(rowKey, []);
-                if (rowAggregator) {
-                  const val = rowAggregator.value();
-                  if (val !== null && val !== undefined && !isNaN(val)) {
-                    rowTotals.push(val);
-                    validValuesFound = true;
-                  }
-                }
-              } catch (e) {
-                console.warn('Error calculating row subtotal for grand total', rowKey, e);
-              }
-            } 
-            // Otherwise, manually calculate the row total from visible columns
-            else {
-              let rowHasValues = false;
-              visibleColKeys.forEach(colKey => {
-                const flatColKey = flatKey(colKey);
-                const isColParent = colKey.length < colAttrs.length;
-                const isColCollapsed = this.state.collapsedCols[flatColKey];
-                
-                if (!isColParent || isColCollapsed) {
-                  try {
-                    const cellAggregator = pivotData.getAggregator(rowKey, colKey);
-                    if (cellAggregator) {
-                      const val = cellAggregator.value();
-                      if (val !== null && val !== undefined && !isNaN(val)) {
-                        rowTotal += val;
-                        rowHasValues = true;
-                      }
-                    }
-                  } catch (e) {
-                    console.warn('Error calculating cell value for row total', rowKey, colKey, e);
-                  }
-                }
-              });
-              
-              if (rowHasValues) {
-                rowTotals.push(rowTotal);
+          try {
+            // Try to get the grand total directly from the pivotData
+            const grandTotalAggregator = pivotData.getAggregator([], []);
+            if (grandTotalAggregator) {
+              const val = grandTotalAggregator.value();
+              if (val !== null && val !== undefined && !isNaN(val)) {
+                grandTotal = val;
                 validValuesFound = true;
               }
             }
-          });
+          } catch (e) {
+            console.warn('Error getting grand total directly, will calculate manually', e);
+          }
           
-          grandTotal = rowTotals.reduce((sum, val) => sum + val, 0);
+          // If we couldn't get the grand total directly, calculate it from all data
+          if (!validValuesFound) {
+            // Get all row keys (not just visible ones)
+            const allRowKeys = pivotData.getRowKeys();
+            const allColKeys = pivotData.getColKeys();
+            
+            // We'll only count leaf nodes to avoid double-counting
+            const leafRowKeys = allRowKeys.filter(rowKey => rowKey.length === rowAttrs.length);
+            const leafColKeys = allColKeys.filter(colKey => colKey.length === colAttrs.length);
+            
+            leafRowKeys.forEach(rowKey => {
+              leafColKeys.forEach(colKey => {
+                try {
+                  const agg = this.safeGetAggregator(pivotData, rowKey, colKey);
+                  if (agg) {
+                    const val = agg.value();
+                    if (val !== null && val !== undefined && !isNaN(val)) {
+                      grandTotal += val;
+                      validValuesFound = true;
+                    }
+                  }
+                } catch (e) {
+                  // Ignore errors for missing combinations
+                }
+              });
+            });
+          }
           
-          const format = pivotData.getAggregator([], []).format;
+          const tempAggregator = this.safeGetAggregator(pivotData, [], []);
+          const format = tempAggregator && tempAggregator.format ? tempAggregator.format : (x => x);
           
           cells.push(
             <td
@@ -1025,7 +1100,7 @@ function makeRenderer(opts = {}) {
               style={opts.heatmapMode && colMapper.grandTotalColor ? colMapper.grandTotalColor : {}}
               onClick={grandTotalCallback}
             >
-              {validValuesFound ? (format ? format(grandTotal) : grandTotal) : '-'}
+              {validValuesFound ? (grandTotal === 0 ? '-' : (format ? format(grandTotal) : grandTotal)) : '-'}
             </td>
           );
         } catch (error) {
@@ -1047,18 +1122,16 @@ function makeRenderer(opts = {}) {
     visibleKeys(keys, collapsed, numAttrs, subtotalDisplay) {
       try {
         if (!keys || !Array.isArray(keys)) {
-          console.warn('Invalid keys in visibleKeys', keys);
+          console.error('Keys must be a valid array');
           return [];
         }
         
         if (!collapsed) {
-          console.warn('Invalid collapsed state in visibleKeys', collapsed);
           collapsed = {};
         }
         
         if (!subtotalDisplay) {
-          console.warn('Invalid subtotalDisplay in visibleKeys', subtotalDisplay);
-          subtotalDisplay = { enabled: true, hideOnExpand: false };
+          subtotalDisplay = { hideOnExpand: false };
         }
         
         const result = [];
@@ -1067,55 +1140,32 @@ function makeRenderer(opts = {}) {
         for (let i = 0; i < keys.length; i++) {
           const key = keys[i];
           
-          if (!key || !Array.isArray(key)) {
-            console.warn('Invalid key in keys array', key);
-            continue;
-          }
-          
-          let isChildOfCollapsed = false;
-          let collapsedParent = null;
-          let collapsedLevel = -1;
-          
-          for (let j = 0; j < key.length - 1; j++) {
-            const parentKey = key.slice(0, j + 1);
-            const parentFlatKey = flatKey(parentKey);
+          // Process the key at each depth level
+          for (let depth = 0; depth < key.length; depth++) {
+            // Create a partial key up to this depth
+            const partialKey = key.slice(0, depth + 1);
+            const flatPartialKey = flatKey(partialKey);
             
-            if (collapsed[parentFlatKey]) {
-              isChildOfCollapsed = true;
-              collapsedParent = parentKey;
-              collapsedLevel = j;
+            // Check if we need to add the subtotal entry for this level
+            if (!addedKeys.has(flatPartialKey)) {
+              // Add the partial key to our result set
+              result.push(partialKey);
+              addedKeys.add(flatPartialKey);
+            }
+            
+            // If this partial key is collapsed, we don't process deeper levels
+            if (collapsed[flatPartialKey]) {
               break;
             }
-          }
-          
-          const flatKeyStr = flatKey(key);
-          
-          if (key.length < numAttrs && collapsed[flatKeyStr]) {
-            if (!addedKeys.has(flatKeyStr)) {
-              result.push(key);
-              addedKeys.add(flatKeyStr);
-            }
-          } 
-          else if (!isChildOfCollapsed) {
-            if (key.length < numAttrs && subtotalDisplay.enabled) {
-              const showSubtotal = !subtotalDisplay.hideOnExpand || collapsed[flatKeyStr];
-              
-              if (showSubtotal && !addedKeys.has(flatKeyStr)) {
-                result.push(key);
-                addedKeys.add(flatKeyStr);
-              }
-            }
             
-            if (!addedKeys.has(flatKeyStr)) {
-              result.push(key);
-              addedKeys.add(flatKeyStr);
-            }
-          } 
-          else if (isChildOfCollapsed && collapsedParent) {
-            const parentFlatKey = flatKey(collapsedParent);
-            if (!addedKeys.has(parentFlatKey)) {
-              result.push(collapsedParent);
-              addedKeys.add(parentFlatKey);
+            // If we've reached the full key and it's not collapsed
+            if (depth === key.length - 1) {
+              // Add the full key if we haven't already
+              const flatFullKey = flatKey(key);
+              if (!addedKeys.has(flatFullKey)) {
+                result.push(key);
+                addedKeys.add(flatFullKey);
+              }
             }
           }
         }
@@ -1125,6 +1175,109 @@ function makeRenderer(opts = {}) {
         console.error('Error in visibleKeys method:', error);
         return [];
       }
+    }
+
+    getSubtotal(rowKey, colKey, pivotSettings) {
+      const { pivotData } = pivotSettings;
+      return pivotData.getAggregator(rowKey, colKey).value();
+    }
+
+    // Helper method to determine if a row or column has subtotal values
+    hasSubtotals(rowOrCol, key, pivotSettings) {
+      const { rowAttrs, colAttrs } = pivotSettings;
+      const attrs = rowOrCol === 'row' ? rowAttrs : colAttrs;
+      
+      // If key length is less than total attributes, it can have subtotals
+      return key.length < attrs.length;
+    }
+
+    // Safely get aggregator, returning null if there's an error
+    safeGetAggregator(pivotData, rowKey, colKey) {
+      try {
+        return pivotData.getAggregator(rowKey, colKey);
+      } catch (error) {
+        // This happens when specific day combinations don't exist in the data
+        return null;
+      }
+    }
+    
+    // Calculate the subtotal for a specific row/column combination
+    calculateSubtotal(pivotData, rowKey, colKey, pivotSettings) {
+      const { rowAttrs, colAttrs } = pivotSettings;
+      
+      // If this is already a leaf node, just return its value
+      if (rowKey.length === rowAttrs.length && colKey.length === colAttrs.length) {
+        const agg = this.safeGetAggregator(pivotData, rowKey, colKey);
+        return agg ? agg.value() : 0;
+      }
+      
+      // For subtotals, we need to sum all child values
+      let total = 0;
+      
+      // Get all possible child row keys for this rowKey
+      const childRowKeys = [];
+      if (rowKey.length < rowAttrs.length) {
+        pivotData.getRowKeys().forEach(fullRowKey => {
+          // Check if this is a child of the current rowKey
+          let isChild = true;
+          for (let i = 0; i < rowKey.length; i++) {
+            if (fullRowKey[i] !== rowKey[i]) {
+              isChild = false;
+              break;
+            }
+          }
+          
+          if (isChild && fullRowKey.length > rowKey.length) {
+            childRowKeys.push(fullRowKey);
+          }
+        });
+      } else {
+        // If we're at a leaf row, just use this row
+        childRowKeys.push(rowKey);
+      }
+      
+      // Get all possible child column keys for this colKey
+      const childColKeys = [];
+      if (colKey.length < colAttrs.length) {
+        pivotData.getColKeys().forEach(fullColKey => {
+          // Check if this is a child of the current colKey
+          let isChild = true;
+          for (let i = 0; i < colKey.length; i++) {
+            if (fullColKey[i] !== colKey[i]) {
+              isChild = false;
+              break;
+            }
+          }
+          
+          if (isChild && fullColKey.length > colKey.length) {
+            childColKeys.push(fullColKey);
+          }
+        });
+      } else {
+        // If we're at a leaf column, just use this column
+        childColKeys.push(colKey);
+      }
+      
+      // If we have no children, try to get the direct value
+      if (childRowKeys.length === 0 || childColKeys.length === 0) {
+        const agg = this.safeGetAggregator(pivotData, rowKey, colKey);
+        return agg ? agg.value() : 0;
+      }
+      
+      // Sum up all child values
+      childRowKeys.forEach(childRowKey => {
+        childColKeys.forEach(childColKey => {
+          const agg = this.safeGetAggregator(pivotData, childRowKey, childColKey);
+          if (agg) {
+            const val = agg.value();
+            if (val !== null && val !== undefined && !isNaN(val)) {
+              total += val;
+            }
+          }
+        });
+      });
+      
+      return total;
     }
 
     render() {
@@ -1179,6 +1332,9 @@ function makeRenderer(opts = {}) {
       const renderedRows = visibleRowKeys.map((rowKey, i) => {
         const rowCells = [];
         
+        // Check if this is a subtotal row (parent row with children)
+        const isSubtotalRow = rowKey.length < rowAttrs.length && opts.subtotals;
+        
         for (let level = 0; level < rowKey.length; level++) {
           const labelKey = `${rowKey.slice(0, level+1).join('|')}`;
           
@@ -1192,6 +1348,10 @@ function makeRenderer(opts = {}) {
             const isCollapsed = this.state.collapsedRows[flatRowKey];
             
             let className = 'pvtRowLabel';
+            if (isSubtotalRow) {
+              className += ' pvtSubtotal';
+            }
+            
             let icon = null;
             
             if (level + 1 < rowAttrs.length) {
@@ -1222,20 +1382,20 @@ function makeRenderer(opts = {}) {
           rowCells.push(
             <th
               key="padding"
-              className="pvtRowLabel"
+              className={`pvtRowLabel ${opts.subtotals ? 'pvtSubtotal' : ''}`}
               colSpan={rowAttrs.length - rowKey.length}
             />
           );
         }
         
         rowCells.push(
-          <th key="separator" className="pvtTotalLabel" />
+          <th key="separator" className={`pvtTotalLabel ${isSubtotalRow && opts.subtotals ? 'pvtSubtotal' : ''}`} />
         );
         
         const dataCells = this.renderTableRow(rowKey, i, pivotSettings);
         
         return (
-          <tr key={`row-${i}`}>
+          <tr key={`row-${i}`} className={isSubtotalRow && opts.subtotals ? 'pvtSubtotalRow' : ''}>
             {rowCells}
             {dataCells}
           </tr>
